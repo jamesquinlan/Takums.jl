@@ -1,9 +1,9 @@
 module Takums
 
-import Base: AbstractFloat, Int, Int8, Int16, Int32, Int64, Integer, Signed,
-	Unsigned, reinterpret
-
+import Base: AbstractFloat, Int, Int8, Int16, Int32, Int64, Integer, MPFR,
+	Signed, Unsigned, reinterpret
 import Printf
+import Random: rand, randexp, AbstractRNG, Sampler
 
 using libtakum_jll
 
@@ -71,6 +71,13 @@ Base.uinttype(::Type{<:AnyTakum16}) = UInt16
 Base.uinttype(::Type{<:AnyTakum32}) = UInt32
 Base.uinttype(::Type{<:AnyTakum64}) = UInt64
 
+@static if VERSION ≥ v"1.10"
+	Base.inttype(::Type{<:AnyTakum8})  = Int8
+	Base.inttype(::Type{<:AnyTakum16}) = Int16
+	Base.inttype(::Type{<:AnyTakum32}) = Int32
+	Base.inttype(::Type{<:AnyTakum64}) = Int64
+end
+
 # the only floating-point property that makes sense to implement for logarithmic takums is signbit()
 Base.signbit(t::AnyTakum8)  = (reinterpret(Unsigned, t) & 0x80) !== 0x00
 Base.signbit(t::AnyTakum16) = (reinterpret(Unsigned, t) & 0x8000) !== 0x0000
@@ -78,8 +85,50 @@ Base.signbit(t::AnyTakum32) = (reinterpret(Unsigned, t) & 0x80000000) !== 0x0000
 Base.signbit(t::AnyTakum64) = (reinterpret(Unsigned, t) & 0x8000000000000000) !== 0x0000000000000000
 
 # left undefined are sign_mask, exponent_mask, exponent_one, exponent_half,
-# significand_mask, exponent_bias, exponent_bits, significand_bits, significand,
-# exponent, decompose, frexp, ldexp, for now also for linear takums
+# significand_mask, exponent_bias, exponent_bits, significand_bits,
+# decompose, for now also for linear takums
+#
+# TODO cleaner, possibly limit to LinearTakums only
+Base.exponent(t::AnyTakum) = exponent(Float64(t))
+Base.significand(t::AnyTakum) = ldexp(t, -Base.exponent(t))
+Base.ldexp(t::AnyTakum, e::Integer) = t * ((typeof(t))(2) .^ e)
+function Base.frexp(t::AnyTakum)
+	exp = isnan(t) ? 0 : (Base.exponent(t) + 1)
+	x = ldexp(t, -exp)
+	return (x, exp)
+end
+
+# decompose returns a triple (number, power, denominator) such that the
+# original value is (number * (2^power) / denominator)
+function Base.decompose(t::AnyTakum)::NTuple{3,Int}
+	U = Base.uinttype(typeof(t))
+
+	# cover special case
+	if isnan(t)
+		return U(0), 0, 0
+	elseif t == zero(t)
+		return U(0), 0, 1
+	end
+
+	# take the absolute value of the input takum so we can work
+	# with the fraction directly
+	tabs = abs(t)
+	denominator = (t < zero(t)) ? -1 : 1
+
+	# obtain the fraction bits by masking them out, set the
+	# fraction_count'th bit, as it is the implicit bit we now need
+	# to store explicitly
+	fraction_count = precision(tabs) - 1
+	number = reinterpret(U, tabs) & ((one(U) << fraction_count) - one(U))
+	number |= one(U) << fraction_count
+
+	# the power is the exponent minus the fraction bit count
+	power = exponent(tabs) - fraction_count
+
+	return number, power, denominator
+end
+
+# TODO implement decompose() for logarithmic takums separately
 
 Base.iszero(t::AnyTakum8)  = reinterpret(Unsigned, t) === 0x00
 Base.iszero(t::AnyTakum16) = reinterpret(Unsigned, t) === 0x0000
@@ -126,7 +175,7 @@ _mantissa_bit_count(t::LinearTakum64) = @ccall libtakum.takum_linear64_precision
 
 function Base.precision(t::AnyTakum; base::Integer = 2)
 	base > 1 || throw(DomainError(base, "`base` cannot be less than 2."))
-	m = _mantissa_bit_count(t)
+	m = 1 + _mantissa_bit_count(t)
 	return base == 2 ? Int(m) : floor(Int, m / log2(base))
 end
 
@@ -227,6 +276,78 @@ LinearTakum16(i::Integer) = Base.convert(LinearTakum16, Base.convert(Float64, i)
 LinearTakum32(i::Integer) = Base.convert(LinearTakum32, Base.convert(Float64, i))
 LinearTakum64(i::Integer) = Base.convert(LinearTakum64, Base.convert(Float64, i))
 Base.promote_rule(T::Type{<:AnyTakum}, ::Type{<:Integer}) = T
+
+# conversion from BigFloat
+Takum8(f::BigFloat) = Takum8(Float64(f))
+Takum16(f::BigFloat) = Takum16(Float64(f))
+Takum32(f::BigFloat) = Takum32(Float64(f))
+LinearTakum8(f::BigFloat) = LinearTakum8(Float64(f))
+LinearTakum16(f::BigFloat) = LinearTakum16(Float64(f))
+LinearTakum32(f::BigFloat) = LinearTakum32(Float64(f))
+
+function LinearTakum64(f::BigFloat)
+	if iszero(f)
+		# truncated() is buggy when the input is zero
+		return zero(LinearTakum64)
+	else
+		# take the absolute value so we are only working with
+		# positive values, as only then can we directly transplant
+		# the fraction bits
+		fabs = abs(f)
+
+		# first round the BigFloat to the maximum possible number
+		# of takum fraction bits, namely 1 + (64 - 5) = 60, as
+		# this possibly rounds the value and lets us obtain the
+		# exponent for further processing
+		f60 = BigFloat(fabs; precision = 60)
+
+		# Build a raw takum with f60's exponent
+		rawt = ldexp(one(LinearTakum64), exponent(f60))
+
+		# Obtain the number of fraction bits the raw takum can
+		# represent and round f60 down to this number of bits
+		fprec = BigFloat(f; precision = precision(rawt))
+
+		# During this process, fprec might have been rounded
+		# insofar that the exponent changed, which would require
+		# us to redo the whole process. We do it unconditionally,
+		# so we take the exponent of fprec, update the raw
+		# takum and round fprec accordingly to its capacity
+		rawt = ldexp(one(LinearTakum64), exponent(fprec))
+		fprec = BigFloat(fprec; precision = precision(rawt))
+
+		# Now we have the raw takum, which we just need to fill
+		# with fprec's fraction bits. For this we make use of
+		# the Base.decompose() function, returning in the first
+		# field an integer representing the fraction bits
+		# (including the implicit 1-bit, shifted all the way
+		# to the left).
+		#
+		# Given we limited the number of fraction bits, we can
+		# safely convert this BigInt into UInt64, shift out the
+		# implicit 1 bit and then shift it to the right such that
+		# it's flush to the right.
+		fraction = (UInt64(Base.decompose(fprec)[1]) << 1) >> (64 - (precision(rawt) - 1))
+
+		# Combine raw takum and fraction
+		result = Base.bitcast(LinearTakum64, Base.bitcast(UInt64, rawt) | fraction)
+
+		# Return the result, negating it if f was negative
+		return (f < 0) ? -result : result
+	end
+end
+
+# TODO Conversion from BigFloat to Takum64
+
+# conversion from irrational numbers
+Takum8(i::AbstractIrrational) = Takum8(Float64(i))
+Takum16(i::AbstractIrrational) = Takum16(Float64(i))
+Takum32(i::AbstractIrrational) = Takum32(Float64(i))
+Takum64(i::AbstractIrrational) = Takum64(Float64(i)) # TODO
+LinearTakum8(i::AbstractIrrational) = LinearTakum8(Float64(i))
+LinearTakum16(i::AbstractIrrational) = LinearTakum16(Float64(i))
+LinearTakum32(i::AbstractIrrational) = LinearTakum32(Float64(i))
+LinearTakum64(i::AbstractIrrational) = LinearTakum64(BigFloat(i; precision = 60))
 
 # conversions to floating-point
 Base.Float16(t::Takum8)  = Float16(@ccall libtakum.takum8_to_float32(reinterpret(Signed, t)::Int8)::Float32)
@@ -446,6 +567,7 @@ Base.:(<=)(x::T, y::T) where {T <: AnyTakum} = reinterpret(Signed, x) <= reinter
 
 Base.isequal(x::T, y::T) where {T <: AnyTakum} = (x == y)
 
+# TODO: widen for 64-bit to BigFloat
 Base.widen(::Type{Takum8}) = Takum16
 Base.widen(::Type{Takum16}) = Takum32
 Base.widen(::Type{Takum32}) = Takum64
@@ -463,7 +585,7 @@ function Base.show(io::IO, t::AnyTakum)
 		Base.print(io, "NaR", string(typeof(t)))
 	else
 		has_type_info || Base.print(io, string(typeof(t)) * "(")
-		@static if VERSION ≥ v"1.7"
+		@static if VERSION ≥ v"1.10"
 			@Printf.printf(IOContext(io, :typeinfo=>typeof(t)), "%.*g", max(4, 1 + Base.precision(t; base = 10)), Float64(t))
 		else
 			@Printf.printf(IOContext(io, :typeinfo=>typeof(t)), "%f", Float64(t))
@@ -478,23 +600,30 @@ Printf.tofloat(t::AnyTakum) = Float64(t)
 Base.bitstring(t::AnyTakum) = Base.bitstring(reinterpret(Unsigned, t))
 
 # next and previous number
-Base.nextfloat(t::Takum8)  = isnar(t) ? NaRTakum8  : Base.bitcast(Takum8, reinterpret(Unsigned, t) + UInt8(1))
-Base.nextfloat(t::Takum16) = isnar(t) ? NaRTakum16 : Base.bitcast(Takum16, reinterpret(Unsigned, t) + UInt16(1))
-Base.nextfloat(t::Takum32) = isnar(t) ? NaRTakum32 : Base.bitcast(Takum32, reinterpret(Unsigned, t) + UInt32(1))
-Base.nextfloat(t::Takum64) = isnar(t) ? NaRTakum64 : Base.bitcast(Takum64, reinterpret(Unsigned, t) + UInt64(1))
-Base.nextfloat(t::LinearTakum8)  = isnar(t) ? NaRLinearTakum8  : Base.bitcast(LinearTakum8, reinterpret(Unsigned, t) + UInt8(1))
-Base.nextfloat(t::LinearTakum16) = isnar(t) ? NaRLinearTakum16 : Base.bitcast(LinearTakum16, reinterpret(Unsigned, t) + UInt16(1))
-Base.nextfloat(t::LinearTakum32) = isnar(t) ? NaRLinearTakum32 : Base.bitcast(LinearTakum32, reinterpret(Unsigned, t) + UInt32(1))
-Base.nextfloat(t::LinearTakum64) = isnar(t) ? NaRLinearTakum64 : Base.bitcast(LinearTakum64, reinterpret(Unsigned, t) + UInt64(1))
+function Base.nextfloat(t::AnyTakum, n::Integer)
+	# preserve NaR
+	if isnar(t)
+		return t
+	end
 
-Base.prevfloat(t::Takum8)  = isnar(t) ? NaRTakum8  : Base.bitcast(Takum8,  reinterpret(Unsigned, t) - UInt8(1))
-Base.prevfloat(t::Takum16) = isnar(t) ? NaRTakum16 : Base.bitcast(Takum16, reinterpret(Unsigned, t) - UInt16(1))
-Base.prevfloat(t::Takum32) = isnar(t) ? NaRTakum32 : Base.bitcast(Takum32, reinterpret(Unsigned, t) - UInt32(1))
-Base.prevfloat(t::Takum64) = isnar(t) ? NaRTakum64 : Base.bitcast(Takum64, reinterpret(Unsigned, t) - UInt64(1))
-Base.prevfloat(t::LinearTakum8)  = isnar(t) ? NaRLinearTakum8  : Base.bitcast(LinearTakum8,  reinterpret(Unsigned, t) - UInt8(1))
-Base.prevfloat(t::LinearTakum16) = isnar(t) ? NaRLinearTakum16 : Base.bitcast(LinearTakum16, reinterpret(Unsigned, t) - UInt16(1))
-Base.prevfloat(t::LinearTakum32) = isnar(t) ? NaRLinearTakum32 : Base.bitcast(LinearTakum32, reinterpret(Unsigned, t) - UInt32(1))
-Base.prevfloat(t::LinearTakum64) = isnar(t) ? NaRLinearTakum64 : Base.bitcast(LinearTakum64, reinterpret(Unsigned, t) - UInt64(1))
+	# convert t to its integral representation
+	t_integer = reinterpret(Signed, t)
+
+	# set result to NaR and catch valid cases later
+	result_integer = typemin(t_integer)
+
+	# check if adding n would under- or overflow, return NaR otherwise
+	if (n >= 0 && t_integer <= reinterpret(Signed, typemax(t)) - n) ||
+	   (n < 0 && t_integer >= reinterpret(Signed, typemin(t)) + (-n))
+		result_integer = typeof(t_integer)(t_integer + n)
+	end
+
+	return Base.bitcast(typeof(t), result_integer)
+end
+Base.prevfloat(t::AnyTakum, n::Integer) = Base.nextfloat(t, -n)
+
+Base.nextfloat(t::AnyTakum) = Base.nextfloat(t, 1)
+Base.prevfloat(t::AnyTakum) = Base.prevfloat(t, 1)
 
 # math functions
 Base.abs(t::AnyTakum) = (t < 0) ? -t : t
@@ -562,6 +691,19 @@ for (takum_type, takum_type_cname, takum_integer_type) in takum_types
 		end
 	end
 end
+
+# random
+rand(rng::AbstractRNG, ::Sampler{T}) where {T <: AnyTakum8} = T(rand(rng, Float64))
+rand(rng::AbstractRNG, ::Sampler{T}) where {T <: AnyTakum16} = T(rand(rng, Float64))
+rand(rng::AbstractRNG, ::Sampler{T}) where {T <: AnyTakum32} = T(rand(rng, Float64))
+rand(rng::AbstractRNG, ::Sampler{Takum64}) = Takum64(rand(rng, Float64)) # TODO
+rand(rng::AbstractRNG, ::Sampler{LinearTakum64}) = setprecision(BigFloat, 60) do; LinearTakum64(rand(rng, BigFloat)) end
+
+randexp(rng::AbstractRNG, ::Sampler{T}) where {T <: AnyTakum8} = T(randexp(rng, Float64))
+randexp(rng::AbstractRNG, ::Sampler{T}) where {T <: AnyTakum16} = T(randexp(rng, Float64))
+randexp(rng::AbstractRNG, ::Sampler{T}) where {T <: AnyTakum32} = T(randexp(rng, Float64))
+randexp(rng::AbstractRNG, ::Sampler{Takum64}) = Takum64(randexp(rng, Float64)) # TODO
+randexp(rng::AbstractRNG, ::Sampler{LinearTakum64}) = setprecision(BigFloat, 60) do; LinearTakum64(randexp(rng, BigFloat)) end
 
 # miscellaneous
 Base.bswap(t::AnyTakum) = Base.bswap_int(t)
